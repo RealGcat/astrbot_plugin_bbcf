@@ -1,6 +1,6 @@
 name: bbcf_move_query
 display_name: BBCF招式查询
-desc: 查询BBCF(苍翼默示录：神观之梦)游戏角色招式数据并渲染为图片
+desc: 查询BBCF(苍翼默示录：神观之梦)游戏角色招式数据及碰撞箱信息并渲染为图片
 version: v1.0.0
 author: AstrBot Plugin Developer
 repo: https://github.com/astrbot/bbcf-move-query

@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-@register("bbcf_move_query", "AstrBot Plugin Developer", "查询BBCF游戏角色招式数据并渲染为图片", "1.0.0")
+@register("bbcf_move_query", "AstrBot Plugin Developer", "查询BBCF游戏角色招式数据及碰撞箱信息并渲染为图片", "1.0.0")
 class BBCFMoveQueryPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -84,7 +84,14 @@ class BBCFMoveQueryPlugin(Star):
                     return move_data
                 
                 # 如果没找到，尝试在其他页面查找
-                return await self.search_move_in_other_pages(character, move)
+                result = await self.search_move_in_other_pages(character, move)
+                if result:
+                    # 尝试获取碰撞箱数据
+                    hitbox_data = await self.get_hitbox_data(character, move)
+                    if hitbox_data:
+                        result.update(hitbox_data)
+                    return result
+                return None
                 
         except asyncio.TimeoutError:
             logger.error(f"请求超时: {character_url}")
@@ -116,7 +123,10 @@ class BBCFMoveQueryPlugin(Star):
                                 'recovery': self.extract_cell_data(cells, 'recovery', '恢复'),
                                 'frame_adv': self.extract_cell_data(cells, 'frame_adv', 'frame', '有利'),
                                 'cancel': self.extract_cell_data(cells, 'cancel', '取消'),
-                                'properties': self.extract_cell_data(cells, 'properties', '属性')
+                                'properties': self.extract_cell_data(cells, 'properties', '属性'),
+                                'hitbox': self.extract_cell_data(cells, 'hitbox', '碰撞箱'),
+                                'pushbox': self.extract_cell_data(cells, 'pushbox', '推箱'),
+                                'hurtbox': self.extract_cell_data(cells, 'hurtbox', '受击箱')
                             }
                             return move_data
             
@@ -151,7 +161,13 @@ class BBCFMoveQueryPlugin(Star):
                 if response.status == 200:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
-                    return self.parse_move_table(soup, move)
+                    move_data = self.parse_move_table(soup, move)
+                    if move_data:
+                        # 尝试在框架数据页面也查找碰撞箱信息
+                        hitbox_data = self.parse_hitbox_table(soup, move)
+                        if hitbox_data:
+                            move_data.update(hitbox_data)
+                        return move_data
             
             return None
             
@@ -162,11 +178,161 @@ class BBCFMoveQueryPlugin(Star):
             logger.error(f"在其他页面搜索招式时发生错误: {e}")
             return None
 
+    async def get_hitbox_data(self, character: str, move: str):
+        """获取角色的碰撞箱数据"""
+        try:
+            # 尝试访问碰撞箱数据页面
+            hitbox_urls = [
+                f"{self.base_url}/{character.capitalize()}/Hitboxes",
+                f"{self.base_url}/{character.capitalize()}/Collision_Data",
+                f"{self.base_url}/{character.capitalize()}/Hitbox_Data"
+            ]
+            
+            timeout = aiohttp.ClientTimeout(total=10)
+            
+            for hitbox_url in hitbox_urls:
+                try:
+                    async with self.session.get(hitbox_url, timeout=timeout) as response:
+                        if response.status == 200:
+                            html = await response.text()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # 查找碰撞箱表格
+                            hitbox_data = self.parse_hitbox_table(soup, move)
+                            if hitbox_data:
+                                return hitbox_data
+                except Exception as e:
+                    logger.debug(f"访问碰撞箱页面失败 {hitbox_url}: {e}")
+                    continue
+            
+            # 如果没有专门的碰撞箱页面，尝试在主页面查找
+            main_url = f"{self.base_url}/{character.capitalize()}"
+            async with self.session.get(main_url, timeout=timeout) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # 查找包含碰撞箱信息的区域
+                    hitbox_data = self.search_hitbox_in_page(soup, move)
+                    if hitbox_data:
+                        return hitbox_data
+            
+            return None
+            
+        except asyncio.TimeoutError:
+            logger.error(f"获取碰撞箱数据超时: {character}")
+            return None
+        except Exception as e:
+            logger.error(f"获取碰撞箱数据时发生错误: {e}")
+            return None
+
+    def parse_hitbox_table(self, soup, move):
+        """解析碰撞箱表格"""
+        try:
+            # 查找碰撞箱相关的表格
+            tables = soup.find_all('table', {'class': ['wikitable', 'hitbox-table', 'collision-table']})
+            
+            for table in tables:
+                rows = table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) >= 2:
+                        # 检查第一列是否包含我们要找的招式
+                        first_cell = cells[0].get_text(strip=True).lower()
+                        if move.lower() in first_cell:
+                            hitbox_data = {
+                                'hitbox': self.extract_cell_data(cells, 'hitbox', 'collision', '攻击箱', '碰撞'),
+                                'pushbox': self.extract_cell_data(cells, 'pushbox', 'push', '推箱'),
+                                'hurtbox': self.extract_cell_data(cells, 'hurtbox', 'hurt', '受击箱', '防御箱')
+                            }
+                            return hitbox_data
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"解析碰撞箱表格时发生错误: {e}")
+            return None
+
+    def search_hitbox_in_page(self, soup, move):
+        """在页面中搜索碰撞箱信息"""
+        try:
+            # 查找包含碰撞箱信息的标题和段落
+            hitbox_sections = soup.find_all(['h2', 'h3', 'h4'], string=re.compile(r'hitbox|collision|碰撞|箱', re.I))
+            
+            for section in hitbox_sections:
+                # 获取该标题后的内容
+                next_sibling = section.find_next_sibling()
+                while next_sibling and next_sibling.name not in ['h2', 'h3', 'h4']:
+                    if next_sibling.name == 'table':
+                        hitbox_data = self.parse_hitbox_table(soup, move)
+                        if hitbox_data:
+                            return hitbox_data
+                    elif next_sibling.name in ['p', 'div']:
+                        text = next_sibling.get_text()
+                        if move.lower() in text.lower():
+                            # 从文本中提取碰撞箱信息
+                            hitbox_info = self.extract_hitbox_from_text(text, move)
+                            if hitbox_info:
+                                return hitbox_info
+                    next_sibling = next_sibling.find_next_sibling()
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"在页面中搜索碰撞箱信息时发生错误: {e}")
+            return None
+
+    def extract_hitbox_from_text(self, text, move):
+        """从文本中提取碰撞箱信息"""
+        try:
+            # 使用正则表达式提取碰撞箱相关的数值
+            hitbox_patterns = [
+                r'hitbox[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'collision[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'攻击箱[:\s]*([0-9]+(?:\.[0-9]+)?)'
+            ]
+            
+            pushbox_patterns = [
+                r'pushbox[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'push[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'推箱[:\s]*([0-9]+(?:\.[0-9]+)?)'
+            ]
+            
+            hurtbox_patterns = [
+                r'hurtbox[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'hurt[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'受击箱[:\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'防御箱[:\s]*([0-9]+(?:\.[0-9]+)?)'
+            ]
+            
+            def extract_value(patterns, text):
+                for pattern in patterns:
+                    match = re.search(pattern, text, re.I)
+                    if match:
+                        return match.group(1)
+                return "N/A"
+            
+            hitbox_data = {
+                'hitbox': extract_value(hitbox_patterns, text),
+                'pushbox': extract_value(pushbox_patterns, text),
+                'hurtbox': extract_value(hurtbox_patterns, text)
+            }
+            
+            # 如果至少有一个值不是N/A，返回数据
+            if any(value != "N/A" for value in hitbox_data.values()):
+                return hitbox_data
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"从文本提取碰撞箱信息时发生错误: {e}")
+            return None
+
     async def render_move_image(self, move_data, character, move):
         """将招式数据渲染为图片"""
         try:
-            # 创建图片
-            width, height = 600, 400
+            # 创建图片 - 增加高度以容纳碰撞箱数据
+            width, height = 600, 500
             img = Image.new('RGB', (width, height), color='white')
             draw = ImageDraw.Draw(img)
             
@@ -213,7 +379,10 @@ class BBCFMoveQueryPlugin(Star):
                 ("恢复帧", move_data['recovery']),
                 ("帧优势", move_data['frame_adv']),
                 ("取消", move_data['cancel']),
-                ("属性", move_data['properties'])
+                ("属性", move_data['properties']),
+                ("碰撞箱", move_data['hitbox']),
+                ("推箱", move_data['pushbox']),
+                ("受击箱", move_data['hurtbox'])
             ]
             
             for label, value in data_items:
